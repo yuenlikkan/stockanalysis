@@ -15,7 +15,11 @@ python -m pip install -r requirements.txt
 Run the script (PowerShell):
 
 ```powershell
-python .\scripts\filter_below_200ma.py --out below_200ma.csv
+# Option A: use forward slashes (works cross-platform)
+python ./scripts/filter_below_200ma.py --out below_200ma.csv
+
+# Option B: PowerShell Windows path — escape backslashes or use a raw string in Python examples
+python .\\scripts\\filter_below_200ma.py --out below_200ma.csv
 ```
 
 Options
@@ -24,7 +28,24 @@ Options
 - `--chunk-size`: number of tickers to download per batch (default 100)
 - `--threads`: threads parameter for yfinance (default 1)
 
+- The script uses the NasdaqTrader file `nasdaqlisted.txt` to obtain tickers.
+- yfinance may occasionally fail for some tickers; the script retries and skips problematic entries.
+- This is intended as a simple screening tool; please backtest and validate before trading.
 Notes
+- The script uses the NasdaqTrader file `nasdaqlisted.txt` to obtain tickers.
+- yfinance may occasionally fail for some tickers; the script retries and skips problematic entries.
+- If you previously ran the script while the docstring contained a backslash escape like `"\s"`, Python may have emitted a SyntaxWarning that can persist in older .pyc files. If you still see the warning after updating files, remove compiled caches and re-run:
+
+```powershell
+# remove any compiled files
+Get-ChildItem -Path . -Recurse -Include *.pyc | Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path . -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+# then run the script again
+python ./scripts/filter_below_200ma.py --out below_200ma.csv
+```
+
+- This is intended as a simple screening tool; please backtest and validate before trading.
 - The script uses the NasdaqTrader file `nasdaqlisted.txt` to obtain tickers.
 - yfinance may occasionally fail for some tickers; the script retries and skips problematic entries.
 - This is intended as a simple screening tool; please backtest and validate before trading.
