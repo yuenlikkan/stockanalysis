@@ -335,6 +335,7 @@ def main(argv: List[str] | None = None) -> int:
         for ticker in batch:
             for attempt in range(3):
                 try:
+                    print(f"Downloading ticker: {ticker} (attempt {attempt+1}/3)")
                     df = yf.download(
                         tickers=ticker,
                         start=start.isoformat(),
@@ -345,10 +346,26 @@ def main(argv: List[str] | None = None) -> int:
                         auto_adjust=False,
                         prepost=False,
                     )
+                    # yfinance may return an empty DataFrame on some errors; check contents
+                    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                        raise RuntimeError("Empty result from yf.download")
                     break
                 except Exception as e:
+                    msg = str(e)
+                    # If we see Yahoo 'Invalid Crumb' / 401 errors, try Ticker.history fallback
+                    if "Invalid Crumb" in msg or "Unauthorized" in msg or "401" in msg:
+                        try:
+                            print(f"yfinance download returned 401/crumb error for {ticker}; trying Ticker.history() fallback")
+                            tk = yf.Ticker(ticker)
+                            df = tk.history(start=start.isoformat(), end=end.isoformat(), actions=False)
+                            if df is None or (isinstance(df, pd.DataFrame) and df.empty):
+                                raise RuntimeError("Empty result from Ticker.history fallback")
+                            break
+                        except Exception:
+                            # fallback failed; treat as a normal retry
+                            pass
                     wait = 1 + attempt * 2
-                    print(f"yfinance download error for {ticker} (attempt {attempt+1}/3): {type(e).__name__}: {str(e)[:200]}... Retrying in {wait}s...")
+                    print(f"yfinance download error for {ticker} (attempt {attempt+1}/3): {type(e).__name__}: {msg[:200]}... Retrying in {wait}s...")
                     time.sleep(wait)
             else:
                 print(f"Failed to download {ticker} after retries; marking as failed")
