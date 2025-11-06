@@ -184,6 +184,7 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--chunk-size", type=int, default=100, help="Number of tickers to download per yfinance batch")
     parser.add_argument("--threads", action="store_true", help="If set, allow multi-threaded yfinance downloads (bool) - off by default for reliability")
     parser.add_argument("--top", type=int, default=0, help="If >0, restrict to top N tickers by market cap before screening")
+    parser.add_argument("--index", choices=["nasdaq100", "dow"], default="nasdaq100", help="Index to screen: 'nasdaq100' (default) or 'dow'")
     args = parser.parse_args(argv)
 
     # Determine history period: we need at least 250 trading days; download 320 calendar days to be safe
@@ -194,7 +195,12 @@ def main(argv: List[str] | None = None) -> int:
     else:
         start = end - dt.timedelta(days=400)
 
-    print("Fetching Nasdaq-100 constituents from Wikipedia (default)...")
+    # Choose index
+    if args.index == "nasdaq100":
+        print("Fetching Nasdaq-100 constituents from Wikipedia (default)...")
+    else:
+        print("Fetching Dow constituents from Wikipedia...")
+
     def fetch_nasdaq100_symbols() -> List[str]:
         url = "https://en.wikipedia.org/wiki/Nasdaq-100"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0 Safari/537.36"}
@@ -241,12 +247,54 @@ def main(argv: List[str] | None = None) -> int:
 
         raise RuntimeError("Could not find Nasdaq-100 table on Wikipedia page")
 
+    def fetch_dow_symbols() -> List[str]:
+        # Dow Jones Industrial Average constituents page
+        url = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0 Safari/537.36"}
+        cachef = os.path.join(os.path.dirname(__file__), "..", "dow_cached.csv")
+        try:
+            r = requests.get(url, timeout=(5, 20), headers=headers)
+            r.raise_for_status()
+            html = r.text
+        except Exception:
+            if os.path.exists(cachef):
+                with open(cachef, "r", encoding="utf-8") as fh:
+                    return [r.strip() for r in fh.read().splitlines() if r.strip()]
+            raise
+
+        try:
+            tables = pd.read_html(html)
+        except ImportError as ie:
+            raise RuntimeError("Missing HTML parser dependency: install 'lxml' (pip install lxml)") from ie
+        except Exception:
+            if os.path.exists(cachef):
+                with open(cachef, "r", encoding="utf-8") as fh:
+                    return [r.strip() for r in fh.read().splitlines() if r.strip()]
+            raise
+
+        # Wikipedia page has a table of DJIA constituents — find the ticker column
+        for t in tables:
+            cols = [c.lower() for c in t.columns.astype(str)]
+            if any("symbol" in c or "ticker" in c for c in cols):
+                ticker_col = [c for c in t.columns.astype(str) if ("symbol" in c.lower() or "ticker" in c.lower())][0]
+                syms = [str(x).strip() for x in t[ticker_col].tolist()]
+                try:
+                    with open(cachef, "w", encoding="utf-8") as fh:
+                        fh.write("\n".join(syms))
+                except Exception:
+                    pass
+                return syms
+        raise RuntimeError("Could not find Dow constituents table on Wikipedia page")
+
     try:
-        symbols = fetch_nasdaq100_symbols()
+        if args.index == "nasdaq100":
+            symbols = fetch_nasdaq100_symbols()
+        else:
+            symbols = fetch_dow_symbols()
     except Exception as e:
-        print(f"Failed to fetch Nasdaq-100 constituents: {type(e).__name__}: {e}")
+        print(f"Failed to fetch symbols: {type(e).__name__}: {e}")
         return 1
-    print(f"Using {len(symbols)} Nasdaq-100 symbols")
+    print(f"Using {len(symbols)} symbols from {args.index}")
 
     # optionally restrict to top N by market cap
     if args.top and args.top > 0:
@@ -281,74 +329,41 @@ def main(argv: List[str] | None = None) -> int:
     total = len(symbols)
     print(f"Got {total} symbols. Downloading historical data in chunks of {args.chunk_size}...")
 
-    # yfinance supports multiple tickers per download
+    # Fetch per-ticker sequentially. Batch downloads using yfinance can hang in some
+    # environments, so we prefer a robust per-ticker approach with retries.
     for batch in tqdm(list(chunked(symbols, args.chunk_size)), desc="batches"):
-        tickers_str = " ".join(batch)
-        # Attempt to download with retries
-        for attempt in range(3):
-            try:
-                data = yf.download(
-                    tickers=batch,
-                    start=start.isoformat(),
-                    end=end.isoformat(),
-                    progress=False,
-                    threads=args.threads,
-                    group_by="ticker",
-                    auto_adjust=False,
-                    prepost=False,
-                )
-                break
-            except Exception as e:
-                wait = 1 + attempt * 2
-                print(f"yfinance download error (attempt {attempt+1}/3): {type(e).__name__}: {str(e)[:200]}... Retrying in {wait}s...")
-                time.sleep(wait)
-        else:
-            print(f"Failed to download batch: {batch[:3]}... skipping")
-            failed_tickers.extend(batch)
-            continue
-
-        # yfinance returns a DataFrame with columns as top-level if multiple tickers
-        if isinstance(data, pd.DataFrame) and isinstance(data.columns, pd.MultiIndex):
-            # iterate tickers
-            for ticker in batch:
+        for ticker in batch:
+            for attempt in range(3):
                 try:
-                    df = data[ticker].dropna(how="all")
-                except Exception:
-                    df = pd.DataFrame()
-                latest_close, ma200, ma200_date = compute_latest_and_ma200(df)
-                if math.isnan(latest_close) and math.isnan(ma200):
-                    failed_tickers.append(ticker)
-                    continue
-                if not math.isnan(ma200) and latest_close < ma200:
-                    out_rows.append((ticker, latest_close, ma200, ma200_date.date() if ma200_date is not None else ""))
-        else:
-            # Single ticker or unexpected shape: yfinance may return single-level columns
-            # Try mapping by order
-            if isinstance(data, pd.DataFrame) and "Close" in data.columns:
-                # Could be single ticker
-                # Try to infer ticker name from batch length
-                ticker = batch[0]
-                latest_close, ma200, ma200_date = compute_latest_and_ma200(data)
-                if math.isnan(latest_close) and math.isnan(ma200):
-                    failed_tickers.append(ticker)
-                elif not math.isnan(ma200) and latest_close < ma200:
-                    out_rows.append((ticker, latest_close, ma200, ma200_date.date() if ma200_date is not None else ""))
+                    df = yf.download(
+                        tickers=ticker,
+                        start=start.isoformat(),
+                        end=end.isoformat(),
+                        progress=False,
+                        threads=False,
+                        group_by="ticker",
+                        auto_adjust=False,
+                        prepost=False,
+                    )
+                    break
+                except Exception as e:
+                    wait = 1 + attempt * 2
+                    print(f"yfinance download error for {ticker} (attempt {attempt+1}/3): {type(e).__name__}: {str(e)[:200]}... Retrying in {wait}s...")
+                    time.sleep(wait)
             else:
-                # Unexpected; attempt per-ticker fetch
-                for ticker in batch:
-                    try:
-                        df = yf.download(ticker, start=start.isoformat(), end=end.isoformat(), progress=False, threads=bool(args.threads))
-                    except Exception as e:
-                        # treat as missing and continue
-                        failed_tickers.append(ticker)
-                        df = pd.DataFrame()
-                    latest_close, ma200, ma200_date = compute_latest_and_ma200(df)
-                    if math.isnan(latest_close) and math.isnan(ma200):
-                        # no data
-                        failed_tickers.append(ticker)
-                        continue
-                    if not math.isnan(ma200) and latest_close < ma200:
-                        out_rows.append((ticker, latest_close, ma200, ma200_date.date() if ma200_date is not None else ""))
+                print(f"Failed to download {ticker} after retries; marking as failed")
+                failed_tickers.append(ticker)
+                continue
+
+            # compute on the returned frame/series
+            latest_close, ma200, ma200_date = compute_latest_and_ma200(df)
+            if math.isnan(latest_close) and math.isnan(ma200):
+                failed_tickers.append(ticker)
+                continue
+            if not math.isnan(ma200) and latest_close < ma200:
+                out_rows.append((ticker, latest_close, ma200, ma200_date.date() if ma200_date is not None else ""))
+            # small pause to be polite to the service
+            time.sleep(0.1)
 
     # Save results
     out_path = os.path.abspath(args.out)
