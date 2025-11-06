@@ -184,7 +184,6 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--chunk-size", type=int, default=100, help="Number of tickers to download per yfinance batch")
     parser.add_argument("--threads", action="store_true", help="If set, allow multi-threaded yfinance downloads (bool) - off by default for reliability")
     parser.add_argument("--top", type=int, default=0, help="If >0, restrict to top N tickers by market cap before screening")
-    parser.add_argument("--nasdaq100", action="store_true", help="If set, use the Nasdaq-100 index constituents instead of the full NASDAQ list")
     args = parser.parse_args(argv)
 
     # Determine history period: we need at least 250 trading days; download 320 calendar days to be safe
@@ -195,50 +194,59 @@ def main(argv: List[str] | None = None) -> int:
     else:
         start = end - dt.timedelta(days=400)
 
-    primary = NASDAQ_SYMBOLS_URLS[0] if NASDAQ_SYMBOLS_URLS else "(none)"
-    print(f"Fetching NASDAQ symbols (primary: {primary})...")
-    symbols = fetch_nasdaq_symbols()
-    if not symbols:
-        print("No symbols found. Exiting.")
-        return 1
+    print("Fetching Nasdaq-100 constituents from Wikipedia (default)...")
+    def fetch_nasdaq100_symbols() -> List[str]:
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0 Safari/537.36"}
 
-    # Optionally use Nasdaq-100 constituents
-    if args.nasdaq100:
-        print("Fetching Nasdaq-100 constituents from Wikipedia...")
-        def fetch_nasdaq100_symbols() -> List[str]:
-            url = "https://en.wikipedia.org/wiki/Nasdaq-100"
-            try:
-                tables = pd.read_html(url)
-            except Exception as e:
-                # try cache
-                cachef = os.path.join(os.path.dirname(__file__), "..", "nasdaq100_cached.csv")
-                if os.path.exists(cachef):
-                    with open(cachef, "r", encoding="utf-8") as fh:
-                        return [r.strip() for r in fh.read().splitlines() if r.strip()]
-                raise
-            # find table with a 'Ticker' or 'Ticker symbol' column
-            for t in tables:
-                cols = [c.lower() for c in t.columns.astype(str)]
-                if any("ticker" in c for c in cols):
-                    # pick the column name that contains 'ticker'
-                    ticker_col = [c for c in t.columns.astype(str) if "ticker" in c.lower()][0]
-                    syms = [str(x).strip() for x in t[ticker_col].tolist()]
-                    # cache
-                    try:
-                        cachef = os.path.join(os.path.dirname(__file__), "..", "nasdaq100_cached.csv")
-                        with open(cachef, "w", encoding="utf-8") as fh:
-                            fh.write("\n".join(syms))
-                    except Exception:
-                        pass
-                    return syms
-            raise RuntimeError("Could not find Nasdaq-100 table on Wikipedia page")
+        cachef = os.path.join(os.path.dirname(__file__), "..", "nasdaq100_cached.csv")
 
+        # Fetch HTML via requests to avoid 403; if network fails, fall back to cache
         try:
-            symbols = fetch_nasdaq100_symbols()
-        except Exception as e:
-            print(f"Failed to fetch Nasdaq-100 constituents: {type(e).__name__}: {e}")
-            return 1
-        print(f"Using {len(symbols)} Nasdaq-100 symbols")
+            r = requests.get(url, timeout=(5, 20), headers=headers)
+            r.raise_for_status()
+            html = r.text
+        except Exception:
+            if os.path.exists(cachef):
+                with open(cachef, "r", encoding="utf-8") as fh:
+                    return [r.strip() for r in fh.read().splitlines() if r.strip()]
+            raise
+
+        # Parse HTML into tables
+        try:
+            tables = pd.read_html(html)
+        except ImportError as ie:
+            raise RuntimeError("Missing HTML parser dependency: install 'lxml' (pip install lxml)") from ie
+        except Exception:
+            # parsing failed; try cache
+            if os.path.exists(cachef):
+                with open(cachef, "r", encoding="utf-8") as fh:
+                    return [r.strip() for r in fh.read().splitlines() if r.strip()]
+            raise
+
+        # find table with a 'Ticker' or 'Ticker symbol' column
+        for t in tables:
+            cols = [c.lower() for c in t.columns.astype(str)]
+            if any("ticker" in c for c in cols):
+                # pick the column name that contains 'ticker'
+                ticker_col = [c for c in t.columns.astype(str) if "ticker" in c.lower()][0]
+                syms = [str(x).strip() for x in t[ticker_col].tolist()]
+                # cache
+                try:
+                    with open(cachef, "w", encoding="utf-8") as fh:
+                        fh.write("\n".join(syms))
+                except Exception:
+                    pass
+                return syms
+
+        raise RuntimeError("Could not find Nasdaq-100 table on Wikipedia page")
+
+    try:
+        symbols = fetch_nasdaq100_symbols()
+    except Exception as e:
+        print(f"Failed to fetch Nasdaq-100 constituents: {type(e).__name__}: {e}")
+        return 1
+    print(f"Using {len(symbols)} Nasdaq-100 symbols")
 
     # optionally restrict to top N by market cap
     if args.top and args.top > 0:
